@@ -1,8 +1,6 @@
 
 # 0. House keeping ####
-knitr::opts_chunk$set(tidy = FALSE)
-knitr::opts_knit$set(root.dir = "D:/Dropbox/Virginia/GLS_multi")
-# knitr::opts_chunk$set(cach.path = 'cache/GLS_analysis')
+
 
 setwd("C:/Users/morer/Dropbox/Virginia/GLS_multi")
 devtools::install_github("SMBC-NZP/MigConnectivity")
