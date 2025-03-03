@@ -7,7 +7,7 @@ pacman::p_load(embarcadero, tidyverse, sf, raster, dismo, spatstat)
                     
 '%!in%' <- function(x,y)!('%in%'(x,y))
 
-source("scripts/migcon_AUX.R")
+source("scripts/0_migcon_AUX.R")
 
 # 0. Load all datasets ####
 predictors_original <- stack("data/env_data/wintering/all_vars.grd")
@@ -19,9 +19,9 @@ names(predictors_original)[8] <- "latitude"
 
 predictors_scaled <- scale(predictors_original)
 
-CALBOR <- readRDS("embarcadero_SDMs/data/CALBOR.RDS")
-CALDIO <- readRDS("embarcadero_SDMs/data/CALDIO.RDS")
-CALEDW <- readRDS("embarcadero_SDMs/data/CALEDW.RDS")
+CALBOR <- readRDS("embarcadero_SDMs/data/iterated_ds/CALBOR_10_iters_list.RDS")
+CALDIO <- readRDS("embarcadero_SDMs/data/iterated_ds/CALDIO_10_iters_list.RDS")
+CALEDW <- readRDS("embarcadero_SDMs/data/iterated_ds/CALEDW_10_iters_list.RDS")
 
 # 1. CALBOR ####
 
@@ -29,46 +29,56 @@ CALEDW <- readRDS("embarcadero_SDMs/data/CALEDW.RDS")
 
 ### Extract covariate values at presences ####
 
-CALBOR_sf <- CALBOR %>% 
-  st_as_sf(coords = c("Longitude", "Latitude"))
+all.cov_list <- list()
+for (i in seq_along(CALBOR)) {
+  # i = 1
+  CALBOR_sub <- CALBOR[[i]]
+  
+  CALBOR_sf <- CALBOR_sub %>% 
+    st_as_sf(coords = c("Longitude", "Latitude"))
+  
+  pres.cov <- raster::extract(predictors_scaled, CALBOR_sf)
+  
+  ### Generate absences and covariate values at absences ####
+  
+  # From the vignette: 
+  # BARTs are like boosted regression trees (BRTs) in that they are sensitive 
+  # to assumed prevalence; anecdotally,I strongly suggest using an equal number 
+  # of presences and absences in your training data. You can experiment with 
+  # the demo data by changing “nrow(ticks)” to “5000” below if you want to see 
+  # some odd model behavior
+  
+  absence <- randomPoints(predictors_scaled$bati, nrow(CALBOR_sf))
+  abs.cov <- raster::extract(predictors_scaled, absence)
+  
+  absence <- randomPoints(predictors_scaled$bati, nrow(CALBOR_sf))
+  abs.cov <- raster::extract(predictors_scaled, absence)
+  
+  ### Code the response ####
+  
+  #' Generate a vector with 1 for presences and 0 for absences (the response)
+  pres.cov <- data.frame(pres.cov)
+  pres.cov$pres <- 1
+  
+  abs.cov <- data.frame(abs.cov)
+  abs.cov$pres <- 0
+  
+  # And one to bind them
+  all.cov <-rbind(pres.cov, abs.cov)
+  head(all.cov)
+  table(all.cov$pres)
+  
+  # drop na's
+  all.cov <- all.cov %>% 
+    drop_na()
+  
+  # check that n is still more or less even between pres and abs
+  table(all.cov$pres)
+  all.cov_list[i] <- list(all.cov)
+  
+}
 
-pres.cov <- raster::extract(predictors_scaled, CALBOR_sf)
 
-### Generate absences and covariate values at absences ####
-
-# From the vignette: 
-# BARTs are like boosted regression trees (BRTs) in that they are sensitive 
-# to assumed prevalence; anecdotally,I strongly suggest using an equal number 
-# of presences and absences in your training data. You can experiment with 
-# the demo data by changing “nrow(ticks)” to “5000” below if you want to see 
-# some odd model behavior
-
-absence <- randomPoints(predictors_scaled$bati, nrow(CALBOR_sf))
-abs.cov <- raster::extract(predictors_scaled, absence)
-
-absence <- randomPoints(predictors_scaled$bati, nrow(CALBOR_sf))
-abs.cov <- raster::extract(predictors_scaled, absence)
-
-### Code the response ####
-
-#' Generate a vector with 1 for presences and 0 for absences (the response)
-pres.cov <- data.frame(pres.cov)
-pres.cov$pres <- 1
-
-abs.cov <- data.frame(abs.cov)
-abs.cov$pres <- 0
-
-# And one to bind them
-all.cov <-rbind(pres.cov, abs.cov)
-head(all.cov)
-table(all.cov$pres)
-
-# drop na's
-all.cov <- all.cov %>% 
-  drop_na()
-
-# check that n is still more or less even between pres and abs
-table(all.cov$pres)
 
 ## 1.2. Run BART model ####
 
@@ -76,122 +86,158 @@ table(all.cov$pres)
 # fine tunned model
 
 # covariate names without latitude
-xvars <- names(predictors_scaled)[-8]
+CB_stack <- stack()
+CB_models <- list()
+for(i in seq_along(all.cov_list)){
+  # i = 1
+  print(paste("Run model iter", i, sep = "_"))
+  
+  xvars <- names(predictors_scaled)[-8]
+  
+  all.cov_sub <- all.cov_list[[i]]
+  calbor.sdm <-bart.step(
+    x.data = all.cov_sub[,xvars],
+    y.data = all.cov_sub[,'pres'],
+    full = TRUE,
+    quiet = F 
+    # iter.step = 10,
+    # iter.plot = 2,
+    # tree.step = 5
+  )
+  # necessary step to save properly (according to Carlson's github but it doesn't work so do all this in one session)
+  invisible(calbor.sdm$fit$state) 
+  CB_models[i] <- list(calbor.sdm)
+  # saveRDS(calbor.sdm, file = "embarcadero_SDMs/final_outputs/CALBOR.BART.sdm.RDS")
+  # savedCALBOR.sdm <- readRDS("embarcadero_SDMs/outputs/CALBOR.BART.sdm.RDS")
+  
+  ## 1.3. Obtain outputs ####
+  
+  ### Make a definitive prediction ####
+  
+  # First we obtain the predicted mean and quantiles
+  CB_prediction <- predict(object = calbor.sdm,
+                           x.layers = predictors_scaled,
+                           quantiles =c(0.5),
+                           splitby = 20,
+                           quiet = TRUE)
+  plot(CB_prediction)
+  
+  # save for definitive plotting
+  CB_stack <- stack(CB_stack, CB_prediction)
+}
 
-calbor.sdm <-bart.step(
-  x.data = all.cov[,xvars],
-  y.data = all.cov[,'pres'],
-  full = TRUE,
-  quiet = F 
-  # iter.step = 10,
-  # iter.plot = 2,
-  # tree.step = 5
-)
 
-# necessary step to save properly (according to Carlson's github but it doesn't work so do all this in one session)
-invisible(calbor.sdm$fit$state) 
-# saveRDS(calbor.sdm, file = "embarcadero_SDMs/final_outputs/CALBOR.BART.sdm.RDS")
-# savedCALBOR.sdm <- readRDS("embarcadero_SDMs/outputs/CALBOR.BART.sdm.RDS")
+CB_stack2 <- dropLayer(CB_stack, c(1,3,5,7,9,11,13,15,17,19))
+plot(CB_stack2)
 
-## 1.3. Obtain outputs ####
-
-### Make a definitive prediction ####
-
-# First we obtain the predicted mean and quantiles
-CB_prediction <- predict(object = calbor.sdm,
-                         x.layers = predictors_scaled,
-                         quantiles =c(0.025, 0.975),
-                         splitby = 20,
-                         quiet = TRUE)
-plot(CB_prediction)
-names(CB_prediction) <- c("Mean", "q2.5%", "q97.5%")
-
-# save for definitive plotting
-writeRaster(CB_prediction, 
-            filename = "embarcadero_SDMs/final_outputs/CALBOR_pred_stack_2024.grd", 
+writeRaster(CB_stack2, 
+            filename = "embarcadero_SDMs/iter_outputs/CALBOR_pred_stack_2024.grd", 
             overwrite = T)
+
+saveRDS(CB_models, file = "embarcadero_SDMs/iter_outputs/CALBOR_models.RDS")
+CB_models <- readRDS("embarcadero_SDMs/iter_outputs/CALBOR_models.RDS")
+
+summary(CB_models[[1]])
 
 # We check how the mean prediction and the two quantiles look
 
 # CB_prediction <- stack("embarcadero_SDMs/outputs/CALBOR_pred_stack.grd")
-par(mfrow = c(2,2))
-plot(CB_prediction[[1]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALBOR prediction mean',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
-
-plot(CB_prediction[[2]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALBOR prediction 2.5%',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
-
-plot(CB_prediction[[3]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALBOR prediction 97.5%',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
-
-plot(CB_prediction[[3]] - CB_prediction[[2]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALBOR prediction CI width',
-     zlim =c(0,0.75),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'CI width', 
-                        side = 2, line = 1.3))
-par(mfrow = c(1,1))
-
-# We now produce a binary map using as cutoff the value suggested by the model summary
-
-plot(CB_prediction[[1]] > 0.5104638  , # cutoff obtained from summary above
-     box = FALSE,
-     axes = FALSE, 
-     main = 'Binary prediction', 
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Presence - absence', 
-                        side = 2, line = 1.3))
-
-# We now produce a map of high uncertainty, plotting a binary map of the areas where the uncertainty (CI width) is in the >75% quantile
-
-quant <- quantile(values(CB_prediction[[3]] - CB_prediction[[2]]), 0.75,
-                  na.rm = TRUE)
-
-plot((CB_prediction[[3]] - CB_prediction[[2]]) > quant,
-     box = FALSE,
-     axes = FALSE,
-     main = "Highest uncertainty zones",
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'CI width', 
-                        side = 2, line = 1.3))
+# par(mfrow = c(2,2))
+# plot(CB_prediction[[1]],
+#      box = FALSE,
+#      axes = FALSE,
+#      main ='CALBOR prediction mean',
+#      zlim =c(0,1),
+#      axis.args = list(at = pretty(0:1), 
+#                       labels = pretty(0:1)),
+#      legend.args = list(text = 'Probability', 
+#                         side = 2, line = 1.3))
+# 
+# plot(CB_prediction[[2]],
+#      box = FALSE,
+#      axes = FALSE,
+#      main ='CALBOR prediction 2.5%',
+#      zlim =c(0,1),
+#      axis.args = list(at = pretty(0:1), 
+#                       labels = pretty(0:1)),
+#      legend.args = list(text = 'Probability', 
+#                         side = 2, line = 1.3))
+# 
+# plot(CB_prediction[[3]],
+#      box = FALSE,
+#      axes = FALSE,
+#      main ='CALBOR prediction 97.5%',
+#      zlim =c(0,1),
+#      axis.args = list(at = pretty(0:1), 
+#                       labels = pretty(0:1)),
+#      legend.args = list(text = 'Probability', 
+#                         side = 2, line = 1.3))
+# 
+# plot(CB_prediction[[3]] - CB_prediction[[2]],
+#      box = FALSE,
+#      axes = FALSE,
+#      main ='CALBOR prediction CI width',
+#      zlim =c(0,0.75),
+#      axis.args = list(at = pretty(0:1), 
+#                       labels = pretty(0:1)),
+#      legend.args = list(text = 'CI width', 
+#                         side = 2, line = 1.3))
+# par(mfrow = c(1,1))
+# 
+# # We now produce a binary map using as cutoff the value suggested by the model summary
+# 
+# plot(CB_prediction[[1]] > 0.5104638  , # cutoff obtained from summary above
+#      box = FALSE,
+#      axes = FALSE, 
+#      main = 'Binary prediction', 
+#      axis.args = list(at = pretty(0:1), 
+#                       labels = pretty(0:1)),
+#      legend.args = list(text = 'Presence - absence', 
+#                         side = 2, line = 1.3))
+# 
+# # We now produce a map of high uncertainty, plotting a binary map of the areas where the uncertainty (CI width) is in the >75% quantile
+# 
+# quant <- quantile(values(CB_prediction[[3]] - CB_prediction[[2]]), 0.75,
+#                   na.rm = TRUE)
+# 
+# plot((CB_prediction[[3]] - CB_prediction[[2]]) > quant,
+#      box = FALSE,
+#      axes = FALSE,
+#      main = "Highest uncertainty zones",
+#      axis.args = list(at = pretty(0:1), 
+#                       labels = pretty(0:1)),
+#      legend.args = list(text = 'CI width', 
+#                         side = 2, line = 1.3))
 
 ### Variable importance ####
 
 # We can now generate a plot of the importance of the included variables
-varimp(calbor.sdm, plots = TRUE)
+varimp_list <- list()
 
-varimp <- varimp(calbor.sdm, plots = F)
+for(i in seq_along(CB_models)) {
+  # i = 1
+  mod_i <- CB_models[[i]]
+  x <- varimp(mod_i, plots = F)
+  varimp_i <- x %>% 
+    mutate(iter = paste0("iter_", i))
+  varimp_list[i] <- list(varimp_i) 
+}
 
-varimp_ordered <- varimp %>% 
-  arrange(-varimps)
 
-write.csv(varimp_ordered, file = "embarcadero_SDMs/final_outputs/CALBOR_varimp.csv")
+varimp_all <- bind_rows(varimp_list)
+varimp_sum <- varimp_all %>% 
+  group_by(names) %>% 
+  summarise(mean = mean(varimps), 
+            sd = sd(varimps)) %>% 
+  ungroup()
+
+
+ggplot(varimp_sum, aes(x = names)) + 
+  geom_point(aes(y = mean)) + 
+  geom_errorbar(aes(ymin = mean-sd, ymax = mean + sd)) + 
+  theme_bw()
+
+write.csv(varimp_sum, file = "embarcadero_SDMs/iter_outputs/CALBOR_varimp_iter.csv")
 
 ### Partial response ####
 
@@ -202,62 +248,102 @@ write.csv(varimp_ordered, file = "embarcadero_SDMs/final_outputs/CALBOR_varimp.c
 # With CI you can add credible intervals, and with trace = TRUE you can see the 
 # dependence plot for each of the trees (remember BARTs are regression trees), 
 # with the thicker line representing the mean of all the trees. 
+all_partials <- list()
 
-chla_partial_cb <- partial(calbor.sdm,
-                        x.vars = "logchla_lag3",
-                        trace = FALSE,
-                        ci = TRUE,
-                        equal = TRUE,
-                        smooth = 10, 
-                        panels = F)
-
-scaled_chla_vals <- scale(predictors_original$logchla_lag3[])
-
-chla_part_df_cb <- chla_partial_cb[[1]]$data %>% 
-  mutate(
-    x2_log = x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center'),
-    x2 = exp(x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center')), 
-    Species = "CALBOR", 
-    Variable = "Chlorophyll A")
-
-
-chla_var_partial_cb <- partial(calbor.sdm,
-                            x.vars = "chla_var",
-                            trace = FALSE,
-                            ci = TRUE,
-                            equal = TRUE,
-                            smooth = 10, 
-                            panels = F)
-
-scaled_chlaVar_vals <- scale(predictors_original$chla_var[])
-
-chlaVar_part_df_cb <- chla_var_partial_cb[[1]]$data %>% 
-  mutate(
-    x2 = x * attr(scaled_chlaVar_vals, 'scaled:scale') + attr(scaled_chlaVar_vals, 'scaled:center'), 
-    Species = "CALBOR", 
-    Variable = "Chlorophyll A variability")
-
-sst_partial_cb <- partial(calbor.sdm,
+for (i in seq_along(CB_models)) {
+  # i = 1
+  print(paste("Run model iter", i, sep = "_"))
+  calbor.sdm <- CB_models[[i]]
+  
+  chla_partial_cb <- partial(calbor.sdm,
+                             x.vars = "logchla_lag3",
+                             trace = FALSE,
+                             ci = TRUE,
+                             equal = TRUE,
+                             smooth = 10, 
+                             panels = F)
+  
+  chla_i <- chla_partial_cb[[1]]$data %>% 
+    mutate(variable = "chla", 
+           iter = paste0("iter_", i))
+  
+  chla_var_partial_cb <- partial(calbor.sdm,
+                                 x.vars = "chla_var",
+                                 trace = FALSE,
+                                 ci = TRUE,
+                                 equal = TRUE,
+                                 smooth = 10, 
+                                 panels = F)
+  
+  chla_var_i <- chla_var_partial_cb[[1]]$data %>% 
+    mutate(variable = "chla_var", 
+           iter = paste0("iter_", i))
+  
+  sst_partial_cb <- partial(calbor.sdm,
                             x.vars = "sst",
                             trace = FALSE,
                             ci = TRUE,
                             equal = TRUE,
                             smooth = 10, 
                             panels = F)
+  
+  sst_i <- sst_partial_cb[[1]]$data %>% 
+    mutate(variable = "sst", 
+           iter = paste0("iter_", i))
+  
+  
+  sal_partial_cb <- partial(calbor.sdm,
+                            x.vars = "sal",
+                            trace = FALSE,
+                            ci = TRUE,
+                            equal = TRUE,
+                            smooth = 10, 
+                            panels = F)
+  
+  
+  sal_i <- sal_partial_cb[[1]]$data %>% 
+    mutate(variable = "sal", 
+           iter = paste0("iter_", i))
+  
+  all_i <- bind_rows(
+    chla_i,
+    chla_var_i,
+    sst_i,
+    sal_i
+  )
+  
+  all_partials[i] <- list(all_i)
+}
 
+
+all_partials_df <- bind_rows(all_partials)
+
+
+scaled_chla_vals <- scale(predictors_original$logchla_lag3[])
+scaled_chlaVar_vals <- scale(predictors_original$chla_var[])
 scaled_sst_vals <- scale(predictors_original$sst[])
-
-sst_part_df_cb <- sst_partial_cb[[1]]$data %>% 
-  mutate(x2 = x * attr(scaled_sst_vals, 'scaled:scale') + attr(scaled_sst_vals, 'scaled:center'), 
-         Species = "CALBOR", 
-         Variable = "Sea surface temperature")
+scaled_sal_vals <- scale(predictors_original$sal[])
 
 
+all_partials_df <- all_partials_df %>% 
+  mutate(
+    x2 = if_else(variable == "chla", x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center'), 
+                 if_else(variable == "chla_var", x * attr(scaled_chlaVar_vals, 'scaled:scale') + attr(scaled_chlaVar_vals, 'scaled:center'), 
+                         if_else(variable == "sst", x * attr(scaled_sst_vals, 'scaled:scale') + attr(scaled_sst_vals, 'scaled:center'), 
+                                 x * attr(scaled_sal_vals, 'scaled:scale') + attr(scaled_sal_vals, 'scaled:center')))), 
+    Species = "CALBOR")
 
-calbor_partials <- bind_rows(sst_part_df_cb, chla_part_df_cb, chlaVar_part_df_cb)
 
-write.csv(calbor_partials, 
-        file = "embarcadero_SDMs/final_outputs/calbor_partial_df.csv")
+
+ggplot(all_partials_df, aes(x = x2)) + 
+  geom_ribbon(aes(ymin = q05, ymax = q95), fill = "lightblue") + 
+  geom_line(aes(y = med)) + 
+  theme_bw() + 
+  facet_grid(iter ~ variable, scales = "free")
+
+write.csv(all_partials_df, 
+        file = "embarcadero_SDMs/iter_outputs/calbor_partial_df_iter.csv")
+
 
 # 2. CALDIO ####
 
@@ -265,186 +351,246 @@ write.csv(calbor_partials,
 
 ### Extract covariate values at presences ####
 
-CALDIO_sf <- CALDIO %>% 
-  st_as_sf(coords = c("Longitude", "Latitude"))
+all.cov_list <- list()
+for (i in seq_along(CALDIO)) {
+  # i = 1
+  CALDIO_sub <- CALDIO[[i]]
+  
+  CALDIO_sf <- CALDIO_sub %>% 
+    st_as_sf(coords = c("Longitude", "Latitude"))
+  
+  pres.cov <- raster::extract(predictors_scaled, CALDIO_sf)
+  
+  ### Generate absences and covariate values at absences ####
+  
+  # From the vignette: 
+  # BARTs are like boosted regression trees (BRTs) in that they are sensitive 
+  # to assumed prevalence; anecdotally,I strongly suggest using an equal number 
+  # of presences and absences in your training data. You can experiment with 
+  # the demo data by changing “nrow(ticks)” to “5000” below if you want to see 
+  # some odd model behavior
+  
+  absence <- randomPoints(predictors_scaled$bati, nrow(CALDIO_sf))
+  abs.cov <- raster::extract(predictors_scaled, absence)
+  
+  absence <- randomPoints(predictors_scaled$bati, nrow(CALDIO_sf))
+  abs.cov <- raster::extract(predictors_scaled, absence)
+  
+  ### Code the response ####
+  
+  #' Generate a vector with 1 for presences and 0 for absences (the response)
+  pres.cov <- data.frame(pres.cov)
+  pres.cov$pres <- 1
+  
+  abs.cov <- data.frame(abs.cov)
+  abs.cov$pres <- 0
+  
+  # And one to bind them
+  all.cov <-rbind(pres.cov, abs.cov)
+  head(all.cov)
+  table(all.cov$pres)
+  
+  # drop na's
+  all.cov <- all.cov %>% 
+    drop_na()
+  
+  # check that n is still more or less even between pres and abs
+  table(all.cov$pres)
+  all.cov_list[i] <- list(all.cov)
+  
+}
 
-pres.cov <- raster::extract(predictors_scaled, CALDIO_sf)
 
-### Generate absences ####
-
-absence <- randomPoints(predictors_scaled, nrow(CALDIO_sf))
-abs.cov <- raster::extract(predictors_scaled, absence)
-
-### Code the response ####
-pres.cov <- data.frame(pres.cov)
-pres.cov$pres <- 1
-
-abs.cov <- data.frame(abs.cov)
-abs.cov$pres <- 0
-
-all.cov <-rbind(pres.cov, abs.cov)
-head(all.cov)
-table(all.cov$pres)
-
-all.cov <- all.cov %>% 
-  drop_na()
-
-table(all.cov$pres)
 
 ## 2.2. Run BART model ####
 
-xvars <-names(predictors_scaled)[-8]
+# Run a function that automatically does variable selection and runs the 
+# fine tunned model
 
-caldio.sdm <-bart.step(x.data = all.cov[,xvars],
-                y.data = all.cov[,'pres'],
-                full = TRUE,
-                quiet = T)
+# covariate names without latitude
+CD_stack <- stack()
+CD_models <- list()
+for(i in seq_along(all.cov_list)){
+  # i = 1
+  xvars <- names(predictors_scaled)[-8]
+  
+  all.cov_sub <- all.cov_list[[i]]
+  caldio.sdm <-bart.step(
+    x.data = all.cov_sub[,xvars],
+    y.data = all.cov_sub[,'pres'],
+    full = TRUE,
+    quiet = F 
+    # iter.step = 10,
+    # iter.plot = 2,
+    # tree.step = 5
+  )
+  # necessary step to save properly (according to Carlson's github but it doesn't work so do all this in one session)
+  invisible(caldio.sdm$fit$state) 
+  CD_models[i] <- list(caldio.sdm)
+  # saveRDS(calbor.sdm, file = "embarcadero_SDMs/final_outputs/CALBOR.BART.sdm.RDS")
+  # savedCALBOR.sdm <- readRDS("embarcadero_SDMs/outputs/CALBOR.BART.sdm.RDS")
+  
+  ## 2.3. Obtain outputs ####
+  
+  ### Make a definitive prediction ####
+  
+  # First we obtain the predicted mean and quantiles
+  CD_prediction <- predict(object = caldio.sdm,
+                           x.layers = predictors_scaled,
+                           quantiles =c(0.5),
+                           splitby = 20,
+                           quiet = TRUE)
+  plot(CD_prediction)
+  
+  # save for definitive plotting
+  CD_stack <- stack(CD_stack, CD_prediction)
+}
 
-## 2.3. Obtain outputs ####
 
-### Make a definitive prediction ####
+CD_stack2 <- dropLayer(CD_stack, c(1,3,5,7,9,11,13,15,17,19))
+plot(CD_stack2)
 
-CD_prediction <- predict(object = caldio.sdm,
-                         x.layers = predictors_scaled,
-                         quantiles =c(0.025, 0.975),
-                         splitby = 20,
-                         quiet = TRUE)
-plot(CD_prediction)
-names(CD_prediction) <- c("Mean", "q2.5%", "q97.5%")
-# writeRaster(CD_prediction, filename = "embarcadero_SDMs/final_outputs/CALDIO_pred_stack_2024.grd", 
-#             overwrite = T)
+writeRaster(CD_stack2, 
+            filename = "embarcadero_SDMs/iter_outputs/CALDIO_pred_stack_2024.grd", 
+            overwrite = T)
 
-# We check how the mean prediction and the two quantiles look
-
-# CD_prediction <- stack("embarcadero_SDMs/outputs/CALBOR_pred_stack_2024.grd")
-par(mfrow = c(2,2))
-plot(CD_prediction[[1]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALDIO prediction mean',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
-
-plot(CD_prediction[[2]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALDIO prediction 2.5%',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
-
-plot(CD_prediction[[3]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALDIO prediction 97.5%',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
-
-plot(CD_prediction[[3]] - CD_prediction[[2]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALDIO prediction CI width',
-     zlim =c(0,0.75),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'CI width', 
-                        side = 2, line = 1.3))
-par(mfrow = c(1,1))
-
-# We now produce a binary map using as cutoff the value suggested by the model summary
-
-plot(CD_prediction[[1]] > 0.4820289, # cutoff obtained from summary above
-     box = FALSE,
-     axes = FALSE, 
-     main = 'Binary prediction', 
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Presence - absence', 
-                        side = 2, line = 1.3))
-
-# We now produce a map of high uncertainty, plotting a binary map of the areas where the uncertainty (CI width) is in the >75% quantile
-
-quant <- quantile(values(CD_prediction[[3]] - CD_prediction[[2]]), 0.75,
-                  na.rm = TRUE)
-
-plot((CD_prediction[[3]] - CD_prediction[[2]]) > quant,
-     box = FALSE,
-     axes = FALSE,
-     main = "Highest uncertainty zones",
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'CI width', 
-                        side = 2, line = 1.3))
+saveRDS(CD_models, file = "embarcadero_SDMs/iter_outputs/CALDIO_models.RDS")
+CD_models <- readRDS("embarcadero_SDMs/iter_outputs/CALDIO_models.RDS")
 
 ### Variable importance ####
-#' 
+
 # We can now generate a plot of the importance of the included variables
+varimp_list <- list()
 
-varimp(caldio.sdm, plots = TRUE)
+for(i in seq_along(CD_models)) {
+  # i = 1
+  mod_i <- CD_models[[i]]
+  x <- varimp(mod_i, plots = F)
+  varimp_i <- x %>% 
+    mutate(iter = paste0("iter_", i))
+  varimp_list[i] <- list(varimp_i) 
+}
 
-varimp <- varimp(caldio.sdm, plots = F)
 
-varimp_ordered <- varimp %>% 
-  arrange(-varimps)
+varimp_all <- bind_rows(varimp_list)
+varimp_sum <- varimp_all %>% 
+  group_by(names) %>% 
+  summarise(mean = mean(varimps), 
+            sd = sd(varimps)) %>% 
+  ungroup()
 
-# write.csv(varimp_ordered, file = "embarcadero_SDMs/final_outputs/CALDIO_varimp.csv")
+
+ggplot(varimp_sum, aes(x = names)) + 
+  geom_point(aes(y = mean)) + 
+  geom_errorbar(aes(ymin = mean-sd, ymax = mean + sd)) + 
+  theme_bw()
+
+write.csv(varimp_sum, file = "embarcadero_SDMs/iter_outputs/CALDIO_varimp_iter.csv")
 
 ### Partial response ####
 
-chla_var_partial_cd <- partial(caldio.sdm,
-                            x.vars = "chla_var",
-                            trace = FALSE,
-                            ci = TRUE,
-                            equal = TRUE,
-                            smooth = 10, 
-                            panels = F)
+# These plots show the mean effect of each variable when measured at all other 
+# values of the other predictors, for all the values of the variable of interest. 
+# This will show us at which values of the covariate the dependence is higher.
 
-chlaVar_part_df_cd <- chla_var_partial_cd[[1]]$data %>% 
-  mutate(
-    x2 = x * attr(scaled_chlaVar_vals, 'scaled:scale') + attr(scaled_chlaVar_vals, 'scaled:center'), 
-    Species = "CALDIO", 
-    Variable = "Chlorophyll A variability")
+# With CI you can add credible intervals, and with trace = TRUE you can see the 
+# dependence plot for each of the trees (remember BARTs are regression trees), 
+# with the thicker line representing the mean of all the trees. 
+all_partials <- list()
 
-chla_partial_cd <- partial(caldio.sdm,
-                        x.vars = "logchla_lag3",
-                        trace = FALSE,
-                        ci = TRUE,
-                        equal = TRUE,
-                        smooth = 10, 
-                        panels = F)
-
-chla_part_df_cd <- chla_partial_cd[[1]]$data %>% 
-  mutate(
-    x2_log = x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center'),
-    x2 = exp(x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center')), 
-    Species = "CALDIO", 
-    Variable = "Chlorophyll A")
-
-sst_partial_cd <- partial(caldio.sdm,
+for (i in seq_along(CD_models)) {
+  # i = 1
+  print(paste("iter", i, sep = "_"))
+  caldio.sdm <- CD_models[[i]]
+  
+  chla_partial_cd <- partial(caldio.sdm,
+                             x.vars = "logchla_lag3",
+                             trace = FALSE,
+                             ci = TRUE,
+                             equal = TRUE,
+                             smooth = 10, 
+                             panels = F)
+  
+  chla_i <- chla_partial_cd[[1]]$data %>% 
+    mutate(variable = "chla", 
+           iter = paste0("iter_", i))
+  
+  chla_var_partial_cd <- partial(caldio.sdm,
+                                 x.vars = "chla_var",
+                                 trace = FALSE,
+                                 ci = TRUE,
+                                 equal = TRUE,
+                                 smooth = 10, 
+                                 panels = F)
+  
+  chla_var_i <- chla_var_partial_cd[[1]]$data %>% 
+    mutate(variable = "chla_var", 
+           iter = paste0("iter_", i))
+  
+  sst_partial_cd <- partial(caldio.sdm,
                             x.vars = "sst",
                             trace = FALSE,
                             ci = TRUE,
                             equal = TRUE,
                             smooth = 10, 
                             panels = F)
+  
+  sst_i <- sst_partial_cd[[1]]$data %>% 
+    mutate(variable = "sst", 
+           iter = paste0("iter_", i))
+  
+  
+  sal_partial_cd <- partial(caldio.sdm,
+                            x.vars = "sal",
+                            trace = FALSE,
+                            ci = TRUE,
+                            equal = TRUE,
+                            smooth = 10, 
+                            panels = F)
+  
+  
+  sal_i <- sal_partial_cd[[1]]$data %>% 
+    mutate(variable = "sal", 
+           iter = paste0("iter_", i))
+  
+  all_i <- bind_rows(
+    chla_i,
+    chla_var_i,
+    sst_i,
+    sal_i
+  )
+  
+  all_partials[i] <- list(all_i)
+}
 
-sst_part_df_cd <- sst_partial_cd[[1]]$data %>% 
+
+ all_partials_df <- bind_rows(all_partials)
+
+
+scaled_chla_vals <- scale(predictors_original$logchla_lag3[])
+scaled_chlaVar_vals <- scale(predictors_original$chla_var[])
+scaled_sst_vals <- scale(predictors_original$sst[])
+scaled_sal_vals <- scale(predictors_original$sal[])
+
+
+all_partials_df <- all_partials_df %>% 
   mutate(
-    x2 = x * attr(scaled_sst_vals, 'scaled:scale') + attr(scaled_sst_vals, 'scaled:center'), 
-    Species = "CALDIO", 
-    Variable = "Sea surface temperature")
+    x2 = if_else(variable == "chla", x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center'), 
+                 if_else(variable == "chla_var", x * attr(scaled_chlaVar_vals, 'scaled:scale') + attr(scaled_chlaVar_vals, 'scaled:center'), 
+                         if_else(variable == "sst", x * attr(scaled_sst_vals, 'scaled:scale') + attr(scaled_sst_vals, 'scaled:center'), 
+                                 x * attr(scaled_sal_vals, 'scaled:scale') + attr(scaled_sal_vals, 'scaled:center')))), 
+    Species = "CALBOR")
 
-caldio_partials <- bind_rows(sst_part_df_cd, chla_part_df_cd, chlaVar_part_df_cd)
-write.csv(caldio_partials, 
-          file = "embarcadero_SDMs/final_outputs/caldio_partial_df.csv")
+
+
+ggplot(all_partials_df, aes(x = x2)) + 
+  geom_ribbon(aes(ymin = q05, ymax = q95), fill = "lightblue") + 
+  geom_line(aes(y = med)) + 
+  theme_bw() + 
+  facet_grid(iter ~ variable, scales = "free")
+
+write.csv(all_partials_df, 
+          file = "embarcadero_SDMs/iter_outputs/caldio_partial_df_iter.csv")
 
 
 # 3. CALEDW ####
@@ -453,380 +599,494 @@ write.csv(caldio_partials,
 
 ### Extract covariate values at presences ####
 
-CALEDW_sf <- CALEDW %>% 
-  st_as_sf(coords = c("Longitude", "Latitude"))
+all.cov_list <- list()
+for (i in seq_along(CALEDW)) {
+  # i = 1
+  CALEDW_sub <- CALEDW[[i]]
+  
+  CALEDW_sf <- CALEDW_sub %>% 
+    st_as_sf(coords = c("Longitude", "Latitude"))
+  
+  pres.cov <- raster::extract(predictors_scaled, CALEDW_sf)
+  
+  ### Generate absences and covariate values at absences ####
+  
+  # From the vignette: 
+  # BARTs are like boosted regression trees (BRTs) in that they are sensitive 
+  # to assumed prevalence; anecdotally,I strongly suggest using an equal number 
+  # of presences and absences in your training data. You can experiment with 
+  # the demo data by changing “nrow(ticks)” to “5000” below if you want to see 
+  # some odd model behavior
+  
+  absence <- randomPoints(predictors_scaled$bati, nrow(CALEDW_sf))
+  abs.cov <- raster::extract(predictors_scaled, absence)
+  
+  absence <- randomPoints(predictors_scaled$bati, nrow(CALEDW_sf))
+  abs.cov <- raster::extract(predictors_scaled, absence)
+  
+  ### Code the response ####
+  
+  #' Generate a vector with 1 for presences and 0 for absences (the response)
+  pres.cov <- data.frame(pres.cov)
+  pres.cov$pres <- 1
+  
+  abs.cov <- data.frame(abs.cov)
+  abs.cov$pres <- 0
+  
+  # And one to bind them
+  all.cov <-rbind(pres.cov, abs.cov)
+  head(all.cov)
+  table(all.cov$pres)
+  
+  # drop na's
+  all.cov <- all.cov %>% 
+    drop_na()
+  
+  # check that n is still more or less even between pres and abs
+  table(all.cov$pres)
+  all.cov_list[i] <- list(all.cov)
+  
+}
 
-pres.cov <- raster::extract(predictors_scaled, CALEDW_sf)
 
-### Generate absences ####
-
-absence <- randomPoints(predictors_scaled, nrow(CALEDW_sf))
-abs.cov <- raster::extract(predictors_scaled, absence)
-
-### Code the response ####
-
-pres.cov <- data.frame(pres.cov)
-pres.cov$pres <- 1
-
-abs.cov <- data.frame(abs.cov)
-abs.cov$pres <- 0
-
-all.cov <-rbind(pres.cov, abs.cov)
-
-table(all.cov$pres)
-
-all.cov %>% 
-  drop_na -> all.cov
-table(all.cov$pres)
 
 ## 3.2. Run BART model ####
-xvars <- names(predictors_scaled)[-8]
-caledw.sdm <-bart.step(x.data = all.cov[,xvars],
-                y.data = all.cov[,'pres'],
-                full = TRUE,
-                quiet = F, 
-                iter.step = 100, 
-                iter.plot = 100, 
-                tree.step = 10)
 
-# saveRDS(caledw.sdm, file = "embarcadero_SDMs/final_outputs/CALEDW.BART.sdm.RDS")
+# Run a function that automatically does variable selection and runs the 
+# fine tunned model
 
-## 3.3. Obtain outputs ####
-### Make a definitive prediction ####
+# covariate names without latitude
+CE_stack <- stack()
+CE_models <- list()
+for(i in seq_along(all.cov_list)){
+  # i = 1
+  xvars <- names(predictors_scaled)[-8]
+  
+  all.cov_sub <- all.cov_list[[i]]
+  CALEDW.sdm <-bart.step(
+    x.data = all.cov_sub[,xvars],
+    y.data = all.cov_sub[,'pres'],
+    full = TRUE,
+    quiet = F 
+    # iter.step = 10,
+    # iter.plot = 2,
+    # tree.step = 5
+  )
+  # necessary step to save properly (according to Carlson's github but it doesn't work so do all this in one session)
+  invisible(CALEDW.sdm$fit$state) 
+  CE_models[i] <- list(CALEDW.sdm)
+  # saveRDS(calbor.sdm, file = "embarcadero_SDMs/final_outputs/CALBOR.BART.sdm.RDS")
+  # savedCALBOR.sdm <- readRDS("embarcadero_SDMs/outputs/CALBOR.BART.sdm.RDS")
+  
+  ## 3.3. Obtain outputs ####
+  
+  ### Make a definitive prediction ####
+  
+  # First we obtain the predicted mean and quantiles
+  CE_prediction <- predict(object = CALEDW.sdm,
+                           x.layers = predictors_scaled,
+                           quantiles =c(0.5),
+                           splitby = 20,
+                           quiet = TRUE)
+  plot(CE_prediction)
+  
+  # save for definitive plotting
+  CE_stack <- stack(CE_stack, CE_prediction)
+}
 
-CE_prediction <- predict(object = caledw.sdm,
-                         x.layers = predictors_scaled,
-                         quantiles =c(0.025, 0.975),
-                         splitby = 20,
-                         quiet = TRUE)
-plot(CE_prediction)
-names(CE_prediction) <- c("Mean", "q2.5%", "q97.5%")
-# writeRaster(CE_prediction, filename = "embarcadero_SDMs/final_outputs/CALEDW_pred_stack_2024.grd", 
-#             overwrite = T)
 
-# CE_prediction <- stack("embarcadero_SDMs/final_outputs/CALBOR_pred_stack_2024.grd")
-par(mfrow = c(2,2))
-plot(CE_prediction[[1]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALEDW prediction mean',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
+CE_stack2 <- dropLayer(CE_stack, c(1,3,5,7,9,11,13,15,17,19))
+plot(CE_stack2)
 
-plot(CE_prediction[[2]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALEDW prediction 2.5%',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
+writeRaster(CE_stack2, 
+            filename = "embarcadero_SDMs/iter_outputs/CALEDW_pred_stack_2024.grd", 
+            overwrite = T)
 
-plot(CE_prediction[[3]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALEDW prediction 97.5%',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability', 
-                        side = 2, line = 1.3))
-
-plot(CE_prediction[[3]] - CE_prediction[[2]],
-     box = FALSE,
-     axes = FALSE,
-     main ='CALEDW prediction CI width',
-     zlim =c(0,0.75),
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'CI width', 
-                        side = 2, line = 1.3))
-par(mfrow = c(1,1))
-
-plot(CE_prediction[[1]] > 0.444, # cutoff obtained from summary above
-     box = FALSE,
-     axes = FALSE, 
-     main = 'Binary prediction', 
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Presence - absence', 
-                        side = 2, line = 1.3))
-
-quant <- quantile(values(CE_prediction[[3]] - CE_prediction[[2]]), 0.75,
-                  na.rm = TRUE)
-
-plot((CE_prediction[[3]] - CE_prediction[[2]]) > quant,
-     box = FALSE,
-     axes = FALSE,
-     main = "Highest uncertainty zones",
-     axis.args = list(at = pretty(0:1), 
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'CI width', 
-                        side = 2, line = 1.3))
+saveRDS(CE_models, file = "embarcadero_SDMs/iter_outputs/CALEDW_models.RDS")
+CE_models <- readRDS("embarcadero_SDMs/iter_outputs/CALEDW_models.RDS")
 
 ### Variable importance ####
-varimp(caledw.sdm, plots = TRUE)
 
-varimp <- varimp(caledw.sdm, plots = F)
+# We can now generate a plot of the importance of the included variables
+varimp_list <- list()
 
-varimp_ordered <- varimp %>% 
-  arrange(-varimps)
+for(i in seq_along(CE_models)) {
+  # i = 1
+  mod_i <- CE_models[[i]]
+  x <- varimp(mod_i, plots = F)
+  varimp_i <- x %>% 
+    mutate(iter = paste0("iter_", i))
+  varimp_list[i] <- list(varimp_i) 
+}
 
-write.csv(varimp_ordered, file = "embarcadero_SDMs/final_outputs/CALEDW_varimp.csv")
+
+varimp_all <- bind_rows(varimp_list)
+varimp_sum <- varimp_all %>% 
+  group_by(names) %>% 
+  summarise(mean = mean(varimps), 
+            sd = sd(varimps)) %>% 
+  ungroup()
+
+
+ggplot(varimp_sum, aes(x = names)) + 
+  geom_point(aes(y = mean)) + 
+  geom_errorbar(aes(ymin = mean-sd, ymax = mean + sd)) + 
+  theme_bw()
+
+write.csv(varimp_sum, file = "embarcadero_SDMs/iter_outputs/CALEDW_varimp_iter.csv")
 
 ### Partial response ####
 
-chla_var_partial_ce <- partial(caledw.sdm,
-                            x.vars = "chla_var",
+# These plots show the mean effect of each variable when measured at all other 
+# values of the other predictors, for all the values of the variable of interest. 
+# This will show us at which values of the covariate the dependence is higher.
+
+# With CI you can add credible intervals, and with trace = TRUE you can see the 
+# dependence plot for each of the trees (remember BARTs are regression trees), 
+# with the thicker line representing the mean of all the trees. 
+all_partials <- list()
+
+for (i in seq_along(CE_models)) {
+  # i = 1
+  print(paste("iter", i, sep = "_"))
+  CALEDW.sdm <- CE_models[[i]]
+  
+  chla_partial_CE <- partial(CALEDW.sdm,
+                             x.vars = "logchla_lag3",
+                             trace = FALSE,
+                             ci = TRUE,
+                             equal = TRUE,
+                             smooth = 10, 
+                             panels = F)
+  
+  chla_i <- chla_partial_CE[[1]]$data %>% 
+    mutate(variable = "chla", 
+           iter = paste0("iter_", i))
+  
+  chla_var_partial_CE <- partial(CALEDW.sdm,
+                                 x.vars = "chla_var",
+                                 trace = FALSE,
+                                 ci = TRUE,
+                                 equal = TRUE,
+                                 smooth = 10, 
+                                 panels = F)
+  
+  chla_var_i <- chla_var_partial_CE[[1]]$data %>% 
+    mutate(variable = "chla_var", 
+           iter = paste0("iter_", i))
+  
+  sst_partial_CE <- partial(CALEDW.sdm,
+                            x.vars = "sst",
                             trace = FALSE,
                             ci = TRUE,
                             equal = TRUE,
                             smooth = 10, 
                             panels = F)
+  
+  sst_i <- sst_partial_CE[[1]]$data %>% 
+    mutate(variable = "sst", 
+           iter = paste0("iter_", i))
+  
+  
+  sal_partial_CE <- partial(CALEDW.sdm,
+                            x.vars = "sal",
+                            trace = FALSE,
+                            ci = TRUE,
+                            equal = TRUE,
+                            smooth = 10, 
+                            panels = F)
+  
+  
+  sal_i <- sal_partial_CE[[1]]$data %>% 
+    mutate(variable = "sal", 
+           iter = paste0("iter_", i))
+  
+  all_i <- bind_rows(
+    chla_i,
+    chla_var_i,
+    sst_i,
+    sal_i
+  )
+  
+  all_partials[i] <- list(all_i)
+}
 
-chlaVar_part_df_ce <- chla_var_partial_ce[[1]]$data %>% 
+
+all_partials_df <- bind_rows(all_partials)
+
+
+scaled_chla_vals <- scale(predictors_original$logchla_lag3[])
+scaled_chlaVar_vals <- scale(predictors_original$chla_var[])
+scaled_sst_vals <- scale(predictors_original$sst[])
+scaled_sal_vals <- scale(predictors_original$sal[])
+
+
+all_partials_df <- all_partials_df %>% 
   mutate(
-    x2 = x * attr(scaled_chlaVar_vals, 'scaled:scale') + attr(scaled_chlaVar_vals, 'scaled:center'), 
-    Species = "CALEDW", 
-    Variable = "Chlorophyll A variability")
-
-chla_partial_ce <- partial(caledw.sdm,
-                        x.vars = "logchla_lag3",
-                        trace = FALSE,
-                        ci = TRUE,
-                        equal = TRUE,
-                        smooth = 10, 
-                        panels = F)
-
-chla_part_df_ce <- chla_partial_ce[[1]]$data %>% 
-  mutate(
-    x2_log = x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center'),
-    x2 = exp(x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center')), 
-    Species = "CALEDW", 
-    Variable = "Chlorophyll A")
-
-sst_partial_ce <- partial(caledw.sdm,
-                       x.vars = "sst",
-                       trace = FALSE,
-                       ci = TRUE,
-                       equal = TRUE,
-                       smooth = 10, 
-                       panels = F)
-
-sst_part_df_ce <- sst_partial_ce[[1]]$data %>% 
-  mutate(
-    x2 = x * attr(scaled_sst_vals, 'scaled:scale') + attr(scaled_sst_vals, 'scaled:center'),
-    Species = "CALEDW", 
-    Variable = "Sea surface temperature")
-
-caledw_partials <- bind_rows(sst_part_df_ce, chla_part_df_ce, chlaVar_part_df_ce)
-
-write.csv(caledw_partials, 
-          file = "embarcadero_SDMs/final_outputs/caledw_partial_df.csv")
+    x2 = if_else(variable == "chla", x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center'), 
+                 if_else(variable == "chla_var", x * attr(scaled_chlaVar_vals, 'scaled:scale') + attr(scaled_chlaVar_vals, 'scaled:center'), 
+                         if_else(variable == "sst", x * attr(scaled_sst_vals, 'scaled:scale') + attr(scaled_sst_vals, 'scaled:center'), 
+                                 x * attr(scaled_sal_vals, 'scaled:scale') + attr(scaled_sal_vals, 'scaled:center')))), 
+    Species = "CALBOR")
 
 
 
+ggplot(all_partials_df, aes(x = x2)) + 
+  geom_ribbon(aes(ymin = q05, ymax = q95), fill = "lightblue") + 
+  geom_line(aes(y = med)) + 
+  theme_bw() + 
+  facet_grid(iter ~ variable, scales = "free")
 
-# 4. All Calonectris ####
+write.csv(all_partials_df, 
+          file = "embarcadero_SDMs/iter_outputs/CALEDW_partial_df_iter.csv")
+
+# 4. CALONECTRIS ####
 
 ## 4.1 Prepare dataset ####
 
 ### Extract covariate values at presences ####
 
-Calonectris <- readRDS("embarcadero_SDMs/data/all_calonectris.RDS")
-Calonectris_sf <- Calonectris %>%
-  st_as_sf(coords = c("Longitude", "Latitude"))
+all.cov_list <- list()
+for (i in seq_along(CALEDW)) {
+  # i = 1
+  CALBOR_sub <- CALBOR[[i]]
+  CALDIO_sub <- CALDIO[[i]]
+  CALEDW_sub <- CALEDW[[i]]
+  
+  CAL <- bind_rows(CALBOR_sub, CALDIO_sub, CALEDW_sub)
+  CAL_sf <- CAL %>% 
+    st_as_sf(coords = c("Longitude", "Latitude"))
+  CAL_sf <- CAL_sf %>% 
+    sample_frac(size = 1/3)
+  
+  pres.cov <- raster::extract(predictors_scaled, CAL_sf)
+  
+  ### Generate absences and covariate values at absences ####
+  
+  # From the vignette: 
+  # BARTs are like boosted regression trees (BRTs) in that they are sensitive 
+  # to assumed prevalence; anecdotally,I strongly suggest using an equal number 
+  # of presences and absences in your training data. You can experiment with 
+  # the demo data by changing “nrow(ticks)” to “5000” below if you want to see 
+  # some odd model behavior
+  
+  absence <- randomPoints(predictors_scaled$bati, nrow(CAL_sf))
+  abs.cov <- raster::extract(predictors_scaled, absence)
+  
+  absence <- randomPoints(predictors_scaled$bati, nrow(CAL_sf))
+  abs.cov <- raster::extract(predictors_scaled, absence)
+  
+  ### Code the response ####
+  
+  #' Generate a vector with 1 for presences and 0 for absences (the response)
+  pres.cov <- data.frame(pres.cov)
+  pres.cov$pres <- 1
+  
+  abs.cov <- data.frame(abs.cov)
+  abs.cov$pres <- 0
+  
+  # And one to bind them
+  all.cov <-rbind(pres.cov, abs.cov)
+  head(all.cov)
+  table(all.cov$pres)
+  
+  # drop na's
+  all.cov <- all.cov %>% 
+    drop_na()
+  
+  # check that n is still more or less even between pres and abs
+  table(all.cov$pres)
+  all.cov_list[i] <- list(all.cov)
+  
+}
 
 
-pres.cov <- raster::extract(predictors_scaled, Calonectris_sf)
-
-### Generate absences ####
-absence <- randomPoints(predictors_scaled, nrow(Calonectris_sf))
-abs.cov <- raster::extract(predictors_scaled, absence)
-
-### Code the response ####
-
-pres.cov <- data.frame(pres.cov)
-pres.cov$pres <- 1
-
-abs.cov <- data.frame(abs.cov)
-abs.cov$pres <- 0
-
-all.cov <-rbind(pres.cov, abs.cov)
-head(all.cov)
-table(all.cov$pres)
-
-all.cov %>%
-  drop_na -> all.cov
-table(all.cov$pres)
 
 ## 4.2. Run BART model ####
 
-xvars <-names(predictors_scaled)[-8]
-calonectris.sdm <-bart.step(x.data = all.cov[,xvars],
-                y.data = all.cov[,'pres'],
-                full = TRUE,
-                quiet = F,
-                iter.step = 100,
-                iter.plot = 100,
-                tree.step = 10)
+# Run a function that automatically does variable selection and runs the 
+# fine tunned model
 
-saveRDS(calonectris.sdm, file = "embarcadero_SDMs/final_outputs/Calonectris.BART.sdm.RDS")
+# covariate names without latitude
+C_stack <- stack()
+C_models <- list()
+for(i in seq_along(all.cov_list)){
+  # i = 1
+  print(paste("iter", i, sep = " "))
+  xvars <- names(predictors_scaled)[-8]
+  
+  all.cov_sub <- all.cov_list[[i]]
+  CAL.sdm <-bart.step(
+    x.data = all.cov_sub[,xvars],
+    y.data = all.cov_sub[,'pres'],
+    full = TRUE,
+    quiet = F 
+    # iter.step = 10,
+    # iter.plot = 2,
+    # tree.step = 5
+  )
+  # necessary step to save properly (according to Carlson's github but it doesn't work so do all this in one session)
+  invisible(CAL.sdm$fit$state) 
+  C_models[i] <- list(CAL.sdm)
+  # saveRDS(calbor.sdm, file = "embarcadero_SDMs/final_outputs/CALBOR.BART.sdm.RDS")
+  # savedCALBOR.sdm <- readRDS("embarcadero_SDMs/outputs/CALBOR.BART.sdm.RDS")
+  
+  ## 3.3. Obtain outputs ####
+  
+  ### Make a definitive prediction ####
+  
+  # First we obtain the predicted mean and quantiles
+  C_prediction <- predict(object = CAL.sdm,
+                          x.layers = predictors_scaled,
+                          quantiles =c(0.5),
+                          splitby = 20,
+                          quiet = TRUE)
+  
+  # save for definitive plotting
+  C_stack <- stack(C_stack, C_prediction)
+}
 
-## 4.3. Obtain outputs ####
 
-### Make a definitive prediction ####
+C_stack2 <- dropLayer(C_stack, c(1,3,5,7,9,11,13,15,17,19))
+plot(C_stack2)
 
-C_prediction <- predict(object = calonectris.sdm,
-                        x.layers = predictors_scaled,
-                        quantiles =c(0.025, 0.975),
-                        splitby = 20,
-                        quiet = TRUE)
-plot(C_prediction)
-names(C_prediction) <- c("Mean", "q2.5%", "q97.5%")
-writeRaster(C_prediction, filename = "embarcadero_SDMs/final_outputs/Calonectris_pred_stack.grd",
+writeRaster(C_stack2, 
+            filename = "embarcadero_SDMs/iter_outputs/CAL_pred_stack_2024.grd", 
             overwrite = T)
 
-C_prediction <- stack("embarcadero_SDMs/outputs/Calonectris_pred_stack.grd")
-par(mfrow = c(2,2))
-plot(C_prediction[[1]],
-     box = FALSE,
-     axes = FALSE,
-     main ='Calonectris prediction mean',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1),
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability',
-                        side = 2, line = 1.3))
-
-plot(C_prediction[[2]],
-     box = FALSE,
-     axes = FALSE,
-     main ='Calonectris prediction 2.5%',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1),
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability',
-                        side = 2, line = 1.3))
-
-plot(C_prediction[[3]],
-     box = FALSE,
-     axes = FALSE,
-     main ='Calonectris prediction 97.5%',
-     zlim =c(0,1),
-     axis.args = list(at = pretty(0:1),
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Probability',
-                        side = 2, line = 1.3))
-
-plot(C_prediction[[3]] - C_prediction[[2]],
-     box = FALSE,
-     axes = FALSE,
-     main ='Calonectris prediction CI width',
-     zlim =c(0,0.75),
-     axis.args = list(at = pretty(0:1),
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'CI width',
-                        side = 2, line = 1.3))
-par(mfrow = c(1,1))
-
-plot(C_prediction[[1]] > 0.5366691 , # cutoff obtained from summary above
-     box = FALSE,
-     axes = FALSE,
-     main = 'Binary prediction',
-     axis.args = list(at = pretty(0:1),
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'Presence - absence',
-                        side = 2, line = 1.3))
-
-quant <- quantile(values(C_prediction[[3]] - C_prediction[[2]]), 0.75,
-                  na.rm = TRUE)
-
-plot((C_prediction[[3]] - C_prediction[[2]]) > quant,
-     box = FALSE,
-     axes = FALSE,
-     main = "Highest uncertainty zones",
-     axis.args = list(at = pretty(0:1),
-                      labels = pretty(0:1)),
-     legend.args = list(text = 'CI width',
-                        side = 2, line = 1.3))
+saveRDS(C_models, file = "embarcadero_SDMs/iter_outputs/CAL_models.RDS")
+C_models <- readRDS("embarcadero_SDMs/iter_outputs/CAL_models.RDS")
 
 ### Variable importance ####
-x <- varimp(calonectris.sdm, plots = TRUE)
 
-varimp <- varimp(calonectris.sdm, plots = F)
+# We can now generate a plot of the importance of the included variables
+varimp_list <- list()
 
-varimp_ordered <- varimp %>%
-  arrange(-varimps)
+for(i in seq_along(C_models)) {
+  # i = 1
+  mod_i <- C_models[[i]]
+  x <- varimp(mod_i, plots = F)
+  varimp_i <- x %>% 
+    mutate(iter = paste0("iter_", i))
+  varimp_list[i] <- list(varimp_i) 
+}
 
-write.csv(varimp_ordered, file = "embarcadero_SDMs/final_outputs/Calonectris_varimp.csv")
+
+varimp_all <- bind_rows(varimp_list)
+varimp_sum <- varimp_all %>% 
+  group_by(names) %>% 
+  summarise(mean = mean(varimps), 
+            sd = sd(varimps)) %>% 
+  ungroup()
+
+
+ggplot(varimp_sum, aes(x = names)) + 
+  geom_point(aes(y = mean)) + 
+  geom_errorbar(aes(ymin = mean-sd, ymax = mean + sd)) + 
+  theme_bw()
+
+write.csv(varimp_sum, file = "embarcadero_SDMs/iter_outputs/CAL_varimp_iter.csv")
 
 ### Partial response ####
 
-bati_partial <- partial(calonectris.sdm,
-                        x.vars = "bati",
-                        trace = FALSE,
-                        ci = TRUE,
-                        equal = TRUE,
-                        smooth = 10,
-                        panels = F)
-p5 <- bati_partial[[1]] + ggtitle("Bathimetry")
+# These plots show the mean effect of each variable when measured at all other 
+# values of the other predictors, for all the values of the variable of interest. 
+# This will show us at which values of the covariate the dependence is higher.
 
-chla_var_partial <- partial(calonectris.sdm,
-                            x.vars = "chla_var",
-                            trace = FALSE,
-                            ci = TRUE,
-                            equal = TRUE,
-                            smooth = 10,
-                            panels = F)
-p2 <- chla_var_partial[[1]] + ggtitle("Chlorophyl A variation")
+# With CI you can add credible intervals, and with trace = TRUE you can see the 
+# dependence plot for each of the trees (remember BARTs are regression trees), 
+# with the thicker line representing the mean of all the trees. 
+all_partials <- list()
 
-chla_partial <- partial(calonectris.sdm,
-                        x.vars = "logchla_lag3",
-                        trace = FALSE,
-                        ci = TRUE,
-                        equal = TRUE,
-                        smooth = 10,
-                        panels = F)
-p3 <- chla_partial[[1]] + ggtitle("Chlorophyl A")
-
-
-sst_partial <- partial(calonectris.sdm,
+for (i in seq_along(C_models)) {
+  # i = 1
+  print(paste("iter", i, sep = "_"))
+  CAL.sdm <- C_models[[i]]
+  
+  chla_partial_C <- partial(CAL.sdm,
+                             x.vars = "logchla_lag3",
+                             trace = FALSE,
+                             ci = TRUE,
+                             equal = TRUE,
+                             smooth = 10, 
+                             panels = F)
+  
+  chla_i <- chla_partial_C[[1]]$data %>% 
+    mutate(variable = "chla", 
+           iter = paste0("iter_", i))
+  
+  chla_var_partial_C <- partial(CAL.sdm,
+                                 x.vars = "chla_var",
+                                 trace = FALSE,
+                                 ci = TRUE,
+                                 equal = TRUE,
+                                 smooth = 10, 
+                                 panels = F)
+  
+  chla_var_i <- chla_var_partial_C[[1]]$data %>% 
+    mutate(variable = "chla_var", 
+           iter = paste0("iter_", i))
+  
+  sst_partial_C <- partial(CAL.sdm,
                             x.vars = "sst",
                             trace = FALSE,
                             ci = TRUE,
                             equal = TRUE,
-                            smooth = 10,
+                            smooth = 10, 
                             panels = F)
-p1 <- sst_partial[[1]] + ggtitle("Sea surface temperature")
-
-sst_grad_partial <- partial(calonectris.sdm,
-                            x.vars = "sst_grad",
-                            trace = FALSE,
-                            ci = TRUE,
-                            equal = TRUE,
-                            smooth = 10,
-                            panels = F)
-p6 <- sst_grad_partial[[1]] + ggtitle("Sea surface temperature gradient")
-
-sal_partial <- partial(calonectris.sdm,
+  
+  sst_i <- sst_partial_C[[1]]$data %>% 
+    mutate(variable = "sst", 
+           iter = paste0("iter_", i))
+  
+  
+  sal_partial_C <- partial(CAL.sdm,
                             x.vars = "sal",
                             trace = FALSE,
                             ci = TRUE,
                             equal = TRUE,
-                            smooth = 10,
+                            smooth = 10, 
                             panels = F)
-p4 <- sal_partial[[1]] + ggtitle("Salinity")
+  
+  
+  sal_i <- sal_partial_C[[1]]$data %>% 
+    mutate(variable = "sal", 
+           iter = paste0("iter_", i))
+  
+  all_i <- bind_rows(
+    chla_i,
+    chla_var_i,
+    sst_i,
+    sal_i
+  )
+  
+  all_partials[i] <- list(all_i)
+}
 
-all_calonectris_partials <- list(p1, p2, p3, p4, p5, p6)
+
+all_partials_df <- bind_rows(all_partials)
 
 
-ggarrange(plotlist = all_calonectris_partials)
+scaled_chla_vals <- scale(predictors_original$logchla_lag3[])
+scaled_chlaVar_vals <- scale(predictors_original$chla_var[])
+scaled_sst_vals <- scale(predictors_original$sst[])
+scaled_sal_vals <- scale(predictors_original$sal[])
 
-saveRDS(all_calonectris_partials, file = "embarcadero_SDMs/final_outputs/Calonectris_partial_plots.RDS")
+
+all_partials_df <- all_partials_df %>% 
+  mutate(
+    x2 = if_else(variable == "chla", x * attr(scaled_chla_vals, 'scaled:scale') + attr(scaled_chla_vals, 'scaled:center'), 
+                 if_else(variable == "chla_var", x * attr(scaled_chlaVar_vals, 'scaled:scale') + attr(scaled_chlaVar_vals, 'scaled:center'), 
+                         if_else(variable == "sst", x * attr(scaled_sst_vals, 'scaled:scale') + attr(scaled_sst_vals, 'scaled:center'), 
+                                 x * attr(scaled_sal_vals, 'scaled:scale') + attr(scaled_sal_vals, 'scaled:center')))))
 
 
+
+ggplot(all_partials_df, aes(x = x2)) + 
+  geom_ribbon(aes(ymin = q05, ymax = q95), fill = "lightblue") + 
+  geom_line(aes(y = med)) + 
+  theme_bw() + 
+  facet_grid(iter ~ variable, scales = "free")
+
+write.csv(all_partials_df, 
+          file = "embarcadero_SDMs/iter_outputs/CAL_partial_df_iter.csv")
